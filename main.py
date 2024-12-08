@@ -7,9 +7,7 @@ from cryptography.hazmat.primitives.padding import PKCS7
 from urllib.parse import urlparse, parse_qs
 import uuid
 from flask import Flask, request, jsonify
-import re
-from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
+import bcrypt
 import base64
 import json
 import jwt

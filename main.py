@@ -93,6 +93,10 @@ def get_aes_key():
         raise ValueError("AES key must be 16, 24, or 32 bytes. Current key length: {}".format(len(aes_key)))
     return aes_key
 
+# Database connection setup
+
+DATABASE = "users.db"
+
 def create_users_table():
     """Create the users table if it doesn't exist."""
     with sqlite3.connect(DATABASE) as conn:
@@ -156,13 +160,37 @@ class MyServer(BaseHTTPRequestHandler):
         params = parse_qs(parsed_path.query)
 
         if parsed_path.path == "/auth":
-            # Retrieve the correct private key based on the 'expired' parameter
-            private_key, key_pem, kid = get_private_key(expired='expired' in params)
+            content_length = int(self.headers.get('Content-Length', 0))
+            data = self.rfile.read(content_length).decode('utf-8')
 
-            if authentication_successful:
-                # Assuming you've retrieved the user_id after successful authentication
-                user_id = get_user_id_from_auth_token(token)  # Replace with your actual logic
-                log_auth_attempt(self.client_address[0], user_id)
+            try:
+                user_data = json.loads(data)
+                username = user_data.get("username")
+                password = user_data.get("password")
+
+                # Validate user credentials (replace with your actual authentication logic)
+                if authenticate_user(username, password):
+                    private_key, key_pem, kid = get_private_key(expired='expired' in params)
+
+                    token_payload = {
+                        "user_id": user_id,  # Replace with the actual user ID
+                        "exp": datetime.now(timezone.utc) + timedelta(hours=1)
+                    }
+                    headers = {"kid": str(kid)}
+
+                    encoded_jwt = jwt.encode(token_payload, key_pem, algorithm="RS256", headers=headers)
+
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(bytes(encoded_jwt, "utf-8"))
+                 else:
+                    self.send_response(401, "Unauthorized")
+                    self.end_headers()
+                     self.wfile.write(b"Invalid username or password")
+            except json.JSONDecodeError:
+                self.send_response(400, "Bad Request")
+                self.end_headers()
+                self.wfile.write(b"Invalid JSON format")
                 
             if private_key:
                 headers = {"kid": str(kid)}  # Set kid from database in header

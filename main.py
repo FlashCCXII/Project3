@@ -81,40 +81,22 @@ def get_private_key(expired=False):
         return private_key, key_pem, kid
     return None, None, None
 
+def create_users_table():
+    """Create the users table if it doesn't exist."""
+    with sqlite3.connect(DATABASE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                email TEXT UNIQUE,
+                date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
+            );
+        """)
 
-env_key = 'NOT_MY_KEY'
-def get_aes_key():
-    """
-    Retrieve and validate the AES key from the environment variable.
-    Ensures the key is 16, 24, or 32 bytes (AES-128, AES-192, AES-256).
-    """
-    aes_key = os.getenv(env_key)
-    if aes_key is None:
-        raise ValueError("Environment variable NOT_MY_KEY is not set.")
-
-    aes_key = aes_key.encode("utf-8")
-    if len(aes_key) not in (16, 24, 32):
-        raise ValueError("AES key must be 16, 24, or 32 bytes. Current key length: {}".format(len(aes_key)))
-    return aes_key
-
-def encrypt_private_key(private_key_pem):
-    """
-    Encrypts the given private key PEM using AES encryption in ECB mode.
-    Applies PKCS#7 padding to handle block size requirements.
-    """
-    aes_key = get_aes_key()
-
-    # Initialize AES cipher in ECB mode
-    cipher = Cipher(algorithms.AES(aes_key), modes.ECB())
-    encryptor = cipher.encryptor()
-
-    # Apply PKCS#7 padding to the private key
-    padder = PKCS7(128).padder()  # 128-bit block size for AES
-    padded_pem = padder.update(private_key_pem) + padder.finalize()
-
-    # Encrypt the padded private key
-    encrypted_pem = encryptor.update(padded_pem) + encryptor.finalize()
-    return encrypted_pem
+create_users_table()
 
 def generate_password():
     """Generates a secure random password using UUIDv4"""

@@ -129,16 +129,57 @@ def register_user(username, email):
     conn.commit()
     return {"password": generate_password()}  # Return only the generated password
 
+def create_auth_logs_table():
+    """Create the auth_logs table if it doesn't exist."""
+    with sqlite3.connect(DATABASE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS auth_logs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_ip TEXT NOT NULL,
+                request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                user_id INTEGER,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+        """)
 
+create_auth_logs_table()
 
-#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+def log_auth_attempt(ip_address, user_id):
+    """Logs an authentication attempt"""
+    cursor.execute("INSERT INTO auth_logs (request_ip, user_id) VALUES (?, ?)", (ip_address, user_id))
+    conn.commit()
+    
 class MyServer(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed_path = urlparse(self.path)
         params = parse_qs(parsed_path.query)
 
         if parsed_path.path == "/auth":
-            # ... (remains unchanged - JWT token generation)
+            # Retrieve the correct private key based on the 'expired' parameter
+            private_key, key_pem, kid = get_private_key(expired='expired' in params)
+
+            if authentication_successful:
+                # Assuming you've retrieved the user_id after successful authentication
+                user_id = get_user_id_from_auth_token(token)  # Replace with your actual logic
+                log_auth_attempt(self.client_address[0], user_id)
+                
+            if private_key:
+                headers = {"kid": str(kid)}  # Set kid from database in header
+                token_payload = {
+                    "user": "username",
+                    "exp": datetime.now(timezone.utc) + timedelta(hours=1) if 'expired' not in params else datetime.now(timezone.utc) - timedelta(hours=1)
+                }
+                # Sign the JWT using the private key in PEM format
+                encoded_jwt = jwt.encode(token_payload, key_pem, algorithm="RS256", headers=headers)
+                
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(bytes(encoded_jwt, "utf-8"))
+            else:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Key not found.")
             return
 
         if parsed_path.path == "/register":

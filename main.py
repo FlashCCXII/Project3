@@ -81,6 +81,20 @@ def get_private_key(expired=False):
         return private_key, key_pem, kid
     return None, None, None
 
+def get_aes_key():
+    """
+    Retrieve and validate the AES key from the environment variable.
+    Ensures the key is 16, 24, or 32 bytes (AES-128, AES-192, AES-256).
+    """
+    aes_key = os.getenv('NOT_MY_KEY')
+    if aes_key is None:
+        raise ValueError("Environment variable NOT_MY_KEY is not set.")
+
+    aes_key = aes_key.encode("utf-8")
+    if len(aes_key) not in (16, 24, 32):
+        raise ValueError("AES key must be 16, 24, or 32 bytes. Current key length: {}".format(len(aes_key)))
+    return aes_key
+
 def create_users_table():
     """Create the users table if it doesn't exist."""
     with sqlite3.connect(DATABASE) as conn:

@@ -7,12 +7,16 @@ from cryptography.hazmat.primitives.padding import PKCS7
 from urllib.parse import urlparse, parse_qs
 import uuid
 from flask import Flask, request, jsonify
-import bcrypt
+import re
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 import base64
 import json
 import jwt
 from datetime import datetime, timezone, timedelta
 import sqlite3
+from threading import Thread
+
 
 # Server configuration
 hostName = "localhost"
@@ -77,6 +81,116 @@ def get_private_key(expired=False):
         return private_key, key_pem, kid
     return None, None, None
 
+
+env_key = 'NOT_MY_KEY'
+def get_aes_key():
+    """
+    Retrieve and validate the AES key from the environment variable.
+    Ensures the key is 16, 24, or 32 bytes (AES-128, AES-192, AES-256).
+    """
+    aes_key = os.getenv(env_key)
+    if aes_key is None:
+        raise ValueError("Environment variable NOT_MY_KEY is not set.")
+
+    aes_key = aes_key.encode("utf-8")
+    if len(aes_key) not in (16, 24, 32):
+        raise ValueError("AES key must be 16, 24, or 32 bytes. Current key length: {}".format(len(aes_key)))
+    return aes_key
+
+def encrypt_private_key(private_key_pem):
+    """
+    Encrypts the given private key PEM using AES encryption in ECB mode.
+    Applies PKCS#7 padding to handle block size requirements.
+    """
+    aes_key = get_aes_key()
+
+    # Initialize AES cipher in ECB mode
+    cipher = Cipher(algorithms.AES(aes_key), modes.ECB())
+    encryptor = cipher.encryptor()
+
+    # Apply PKCS#7 padding to the private key
+    padder = PKCS7(128).padder()  # 128-bit block size for AES
+    padded_pem = padder.update(private_key_pem) + padder.finalize()
+
+    # Encrypt the padded private key
+    encrypted_pem = encryptor.update(padded_pem) + encryptor.finalize()
+    return encrypted_pem
+
+
+# Database connection setup
+DATABASE = "users.db"
+
+def create_users_table():
+    """Create the users table if it doesn't exist."""
+    with sqlite3.connect(DATABASE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                email TEXT UNIQUE,
+                date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
+            );
+        """)
+
+create_users_table()
+
+# Flask app initialization
+app = Flask(__name__)
+
+# Argon2 password hasher configuration
+ph = PasswordHasher(time_cost=2, memory_cost=102400, parallelism=8, hash_len=32, salt_len=16)
+
+@app.route("/register", methods=["POST"])
+def register_user():
+    """
+    Handles user registration.
+    Accepts JSON with 'username' and 'email', generates a secure UUIDv4 password,
+    hashes the password with Argon2, and stores user details in the database.
+    """
+    try:
+        # Parse and validate input JSON
+        data = request.get_json()
+        username = data.get("username")
+        email = data.get("email")
+
+        if not username or not email:
+            return jsonify({"error": "Username and email are required."}), 400
+
+        # Validate email format
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+            return jsonify({"error": "Invalid email format."}), 400
+
+        # Generate a secure password using UUIDv4
+        password = str(uuid.uuid4())
+
+        # Hash the password using Argon2
+        password_hash = ph.hash(password)
+
+        # Save user details in the database
+        with sqlite3.connect(DATABASE) as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO users (username, password_hash, email) 
+                    VALUES (?, ?, ?)
+                    """,
+                    (username, password_hash, email),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError as e:
+                return jsonify({"error": "Username or email already exists."}), 409
+
+        # Return the generated password to the user
+        return jsonify({"password": password}), 201
+
+    except Exception as e:
+        return jsonify({"error": "An error occurred during registration.", "details": str(e)}), 500
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 class MyServer(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed_path = urlparse(self.path)
@@ -154,62 +268,7 @@ class MyServer(BaseHTTPRequestHandler):
         self.send_response(405)
         self.end_headers()
 
-env_key = 'NOT_MY_KEY'
-def get_aes_key():
-    """
-    Retrieve and validate the AES key from the environment variable.
-    Ensures the key is 16, 24, or 32 bytes (AES-128, AES-192, AES-256).
-    """
-    aes_key = os.getenv(env_key)
-    if aes_key is None:
-        raise ValueError("Environment variable NOT_MY_KEY is not set.")
-
-    aes_key = aes_key.encode("utf-8")
-    if len(aes_key) not in (16, 24, 32):
-        raise ValueError("AES key must be 16, 24, or 32 bytes. Current key length: {}".format(len(aes_key)))
-    return aes_key
-
-def encrypt_private_key(private_key_pem):
-    """
-    Encrypts the given private key PEM using AES encryption in ECB mode.
-    Applies PKCS#7 padding to handle block size requirements.
-    """
-    aes_key = get_aes_key()
-
-    # Initialize AES cipher in ECB mode
-    cipher = Cipher(algorithms.AES(aes_key), modes.ECB())
-    encryptor = cipher.encryptor()
-
-    # Apply PKCS#7 padding to the private key
-    padder = PKCS7(128).padder()  # 128-bit block size for AES
-    padded_pem = padder.update(private_key_pem) + padder.finalize()
-
-    # Encrypt the padded private key
-    encrypted_pem = encryptor.update(padded_pem) + encryptor.finalize()
-    return encrypted_pem
-
-
-# Database connection setup
-DATABASE = "users.db"
-
-def create_users_table():
-    """Create the users table if it doesn't exist."""
-    with sqlite3.connect(DATABASE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                email TEXT UNIQUE,
-                date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_login TIMESTAMP
-            );
-        """)
-
-create_users_table()
-
-if __name__ == "__main__":
+def run_webserver():
     webServer = HTTPServer((hostName, serverPort), MyServer)
     try:
         print(f"Server started at http://{hostName}:{serverPort}")
@@ -221,4 +280,18 @@ if __name__ == "__main__":
     webServer.server_close()
     conn.close()
     print("Server stopped.")
-   
+
+def run_flask():
+        app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+if __name__ == "__main__":
+    # Run both servers concurrently
+    flask_thread = Thread(target=run_flask)
+    http_thread = Thread(target=run_webserver)
+
+    flask_thread.start()
+    http_thread.start()
+
+    flask_thread.join()
+    http_thread.join()

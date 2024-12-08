@@ -20,6 +20,8 @@ from threading import Thread
 hostName = "localhost"
 serverPort = 8080
 
+DATABASE = "totally_not_my_privateKeys.db"
+
 # Initialize SQLite database
 conn = sqlite3.connect("totally_not_my_privateKeys.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -93,10 +95,6 @@ def get_aes_key():
         raise ValueError("AES key must be 16, 24, or 32 bytes. Current key length: {}".format(len(aes_key)))
     return aes_key
 
-# Database connection setup
-
-DATABASE = "users.db"
-
 def create_users_table():
     """Create the users table if it doesn't exist."""
     with sqlite3.connect(DATABASE) as conn:
@@ -149,66 +147,89 @@ def create_auth_logs_table():
 
 create_auth_logs_table()
 
+
 def log_auth_attempt(ip_address, user_id):
     """Logs an authentication attempt"""
     cursor.execute("INSERT INTO auth_logs (request_ip, user_id) VALUES (?, ?)", (ip_address, user_id))
     conn.commit()
-    
+
+def authenticate_user(username, password):
+    """Authenticate the user by verifying the provided credentials."""
+    cursor.execute("SELECT id, password_hash FROM users WHERE username = ?", (username,))
+    user = cursor.fetchone()
+    if user:
+        user_id, stored_password_hash = user
+        # Verify the password
+        if bcrypt.checkpw(password.encode(), stored_password_hash.encode()):
+            return True, user_id
+    return False, None
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 class MyServer(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed_path = urlparse(self.path)
         params = parse_qs(parsed_path.query)
 
         if parsed_path.path == "/auth":
+            # Parse JSON data from request body
             content_length = int(self.headers.get('Content-Length', 0))
             data = self.rfile.read(content_length).decode('utf-8')
-
             try:
-                user_data = json.loads(data)
-                username = user_data.get("username")
-                password = user_data.get("password")
+                auth_data = json.loads(data)
+                username = auth_data.get("username")
+                password = auth_data.get("password")
 
-                # Validate user credentials (replace with your actual authentication logic)
-                if authenticate_user(username, password):
+                if not username or not password:
+                    self.send_response(400, "Bad Request")
+                    self.end_headers()
+                    self.wfile.write(b"Missing username or password in request body.")
+                    return
+
+                # Authenticate the user
+                authentication_successful, user_id = authenticate_user(username, password)
+
+                if authentication_successful:
+                    # Log the successful authentication attempt
+                    log_auth_attempt(self.client_address[0], user_id)
+
+                    # Retrieve the correct private key
                     private_key, key_pem, kid = get_private_key(expired='expired' in params)
 
-                    token_payload = {
-                        "user_id": user_id,  # Replace with the actual user ID
-                        "exp": datetime.now(timezone.utc) + timedelta(hours=1)
-                    }
-                    headers = {"kid": str(kid)}
+                    if private_key:
+                        headers = {"kid": str(kid)}  # Set kid from database in header
+                        token_payload = {
+                            "user": username,
+                            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()
+                            if 'expired' not in params else
+                            (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp()
+                        }
+                        # Sign the JWT using the private key in PEM format
+                        encoded_jwt = jwt.encode(token_payload, key_pem, algorithm="RS256", headers=headers)
 
-                    encoded_jwt = jwt.encode(token_payload, key_pem, algorithm="RS256", headers=headers)
-
-                    self.send_response(200)
-                    self.end_headers()
-                    self.wfile.write(bytes(encoded_jwt, "utf-8"))
-                 else:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(bytes(json.dumps({"token": encoded_jwt}), "utf-8"))
+                        return
+                    else:
+                        self.send_response(404, "Not Found")
+                        self.end_headers()
+                        self.wfile.write(b"Key not found.")
+                        return
+                else:
+                    # Log the failed authentication attempt
+                    log_auth_attempt(self.client_address[0], None)
                     self.send_response(401, "Unauthorized")
                     self.end_headers()
-                     self.wfile.write(b"Invalid username or password")
+                    self.wfile.write(b"Invalid username or password.")
+                    return
             except json.JSONDecodeError:
                 self.send_response(400, "Bad Request")
                 self.end_headers()
-                self.wfile.write(b"Invalid JSON format")
-                
-            if private_key:
-                headers = {"kid": str(kid)}  # Set kid from database in header
-                token_payload = {
-                    "user": "username",
-                    "exp": datetime.now(timezone.utc) + timedelta(hours=1) if 'expired' not in params else datetime.now(timezone.utc) - timedelta(hours=1)
-                }
-                # Sign the JWT using the private key in PEM format
-                encoded_jwt = jwt.encode(token_payload, key_pem, algorithm="RS256", headers=headers)
-                
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(bytes(encoded_jwt, "utf-8"))
-            else:
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(b"Key not found.")
-            return
+                self.wfile.write(b"Invalid JSON format in request body.")
+                return
+
+        self.send_response(405)
+        self.end_headers()
 
         if parsed_path.path == "/register":
             content_length = int(self.headers.get('Content-Length', 0))
@@ -297,7 +318,7 @@ if __name__ == "__main__":
         webServer.serve_forever()
     except KeyboardInterrupt:
         pass
-        
+
     webServer.server_close()
     conn.close()
     print("Server stopped.")

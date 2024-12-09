@@ -1,324 +1,290 @@
-import os
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import jwt
+from datetime import datetime, timedelta, timezone
+import sqlite3
+import bcrypt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.padding import PKCS7
-from urllib.parse import urlparse, parse_qs
-import uuid
-from flask import Flask, request, jsonify
-import bcrypt
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.backends import default_backend
 import base64
-import json
-import jwt
-from datetime import datetime, timezone, timedelta
-import sqlite3
-from threading import Thread
+import os
+import uuid
+from time import time
 
 
-# Server configuration
-hostName = "localhost"
-serverPort = 8080
+app = Flask(__name__)
+db_file = 'totally_not_my_privateKeys.db'
 
-DATABASE = "totally_not_my_privateKeys.db"
+# rate limiting
+limiter = Limiter(get_remote_address, app=app, default_limits=["100 per day", "25 per hour"], headers_enabled=True)
+auth_limit = "10 per second"
 
-# Initialize SQLite database
-conn = sqlite3.connect("totally_not_my_privateKeys.db", check_same_thread=False)
-cursor = conn.cursor()
+# secret key for jwt encoding
+SECRET_KEY = 'your_secret_key'
 
-# Create table for storing keys if it doesn’t exist
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS keys(
-        kid INTEGER PRIMARY KEY AUTOINCREMENT,
-        key BLOB NOT NULL,
-        exp INTEGER NOT NULL
-    )
-''')
-conn.commit()
 
-def int_to_base64(value):
+def int_to_base64url(value):
     """Convert an integer to a Base64URL-encoded string"""
     value_hex = format(value, 'x')
+    # Ensure even length
     if len(value_hex) % 2 == 1:
         value_hex = '0' + value_hex
     value_bytes = bytes.fromhex(value_hex)
     encoded = base64.urlsafe_b64encode(value_bytes).rstrip(b'=')
     return encoded.decode('utf-8')
 
-def save_key_to_db(key, expiration_time):
-    pem = key.private_bytes(
+
+def init_db():
+    """Initialize the database with the required schema"""
+    conn = sqlite3.connect(db_file)
+    c = conn.cursor()
+    c.execute(''' CREATE TABLE IF NOT EXISTS keys(
+        kid INTEGER PRIMARY KEY AUTOINCREMENT,
+        key BLOB NOT NULL,
+        exp INTEGER NOT NULL)''')
+    conn.commit()
+    conn.close()
+
+
+def init_users_table():
+    """Initialize the users table in the database"""
+    conn = sqlite3.connect(db_file)
+    c = conn.cursor()
+    c.execute(''' CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        email TEXT UNIQUE,
+        date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_login TIMESTAMP      
+    )''')
+    conn.commit()
+    conn.close()
+
+
+def init_auth_logs_table():
+    """Initialize the authentication logs table in database"""
+    conn = sqlite3.connect(db_file)
+    c = conn.cursor()
+    c.execute(''' CREATE TABLE IF NOT EXISTS auth_logs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_ip TEXT NOT NULL,
+        request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        user_id INTEGER,  
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )''')
+    conn.commit()
+    conn.close()
+
+
+def generate_jwt_token(user_id):
+    """Generate jwt token for user id"""
+    try:
+        expiration = datetime.utcnow() + timedelta(hours=1)
+
+        payload = {
+            'user_id': user_id,
+            'exp': expiration
+        }
+
+        token = jwt.encode(payload, SECRET_KEY, algorithm='HS256')
+
+        return token if isinstance(token, bytes) else token.encode('utf-8')
+
+    except Exception as e:
+        print(f"Error generating JWT token: {e}")
+        return None
+
+
+def decode_jwt_token(token):
+    """decode a jwt token"""
+    try:
+        if not isinstance(token, bytes):
+            token = token.encode('utf-8')
+
+        payload = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+        return payload
+    except jwt.ExpiredSignatureError:
+        return {'error': 'Token has expired'}
+    except jwt.InvalidTokenError as e:
+        return {'error': str(e)}
+
+
+def get_encryption_key():
+    """ Get the encryption key"""
+    key = os.environ.get('NOT_MY_KEY')
+    if key is None:
+        raise ValueError("Environment variable NOT_MY_KEY is not set.")
+    return base64.urlsafe_b64decode(key)
+
+
+def encrypt_key(key_pem):
+    """encrypt a key using AES encryption"""
+    key = get_encryption_key()
+    iv = os.urandom(16)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+
+    # pads key to match size of cipher
+    padder = padding.PKCS7(algorithms.AES.block_size).padder()
+    padded_data = padder.update(key_pem) + padder.finalize()
+
+    encrypted_key = iv + encryptor.update(padded_data) + encryptor.finalize()
+    return base64.urlsafe_b64encode(encrypted_key).decode('utf-8')
+
+
+def decrypt_key(encrypted_key):
+    """decrypt AES encrypted key"""
+    key = get_encryption_key()
+    encrypted_key_bytes = base64.urlsafe_b64decode(encrypted_key)
+
+    iv = encrypted_key_bytes[:16]
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+
+    #  decrypt and remove padding
+    decrypted_padded_data = decryptor.update(encrypted_key_bytes[16:]) + decryptor.finalize()
+
+    unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+    decrypted_data = unpadder.update(decrypted_padded_data) + unpadder.finalize()
+
+    return decrypted_data
+
+
+def store_key(key_pem, exp_timestamp):
+    """Store a private key and its expiration in the database"""
+    conn = sqlite3.connect(db_file)
+    c = conn.cursor()
+    c.execute('INSERT INTO keys (key, exp) VALUES (?,?)',
+              (key_pem, exp_timestamp))
+
+    kid = c.lastrowid
+    conn.commit()
+    conn.close()
+    return kid
+
+
+def get_valid_key():
+    """Get a non-expired private key from the database"""
+    conn = sqlite3.connect(db_file)
+    c = conn.cursor()
+    current_time = int(datetime.now(timezone.utc).timestamp())
+    c.execute('SELECT kid, key, exp FROM keys WHERE exp > ? LIMIT 1',
+              (current_time,))
+    result = c.fetchone()
+    conn.close()
+
+    if result:
+        kid, encrypted_key, exp = result
+        decrypted_key = decrypt_key(encrypted_key)
+        return kid, decrypted_key, exp
+    return None
+
+
+def generate_and_store_keys():
+    """Generate and store both valid and expired keys"""
+    # Generate expired key
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048
+    )
+    pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption()
     )
-    cursor.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (pem, expiration_time))
-    conn.commit()
+    exp_timestamp = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp())
+    store_key(pem, exp_timestamp)
+
+    # Generate valid key
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048
+    )
+
+    pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    exp_timestamp = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
+    store_key(pem, exp_timestamp)
 
 
-# Generate a valid and expired key for testing
-signing_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-now = int(datetime.now(timezone.utc).timestamp())
-one_hour_key = now + 3600
-expired_time = now - 3600
-save_key_to_db(signing_key, one_hour_key)
-save_key_to_db(signing_key, expired_time)
-
-
-def get_private_key(expired=False):
-    now = int(datetime.now(timezone.utc).timestamp())
-    if expired:
-        cursor.execute("SELECT kid, key FROM keys WHERE exp < ?", (now,))
-    else:
-        cursor.execute("SELECT kid, key FROM keys WHERE exp > ?", (now,))
-
-    row = cursor.fetchone()
-    if row:
-        kid, key_pem = row[0], row[1]
-        private_key = serialization.load_pem_private_key(
-            key_pem,
-            password=None,
-        )
-        return private_key, key_pem, kid
-    return None, None, None
-
-def get_aes_key():
-    """
-    Retrieve and validate the AES key from the environment variable.
-    Ensures the key is 16, 24, or 32 bytes (AES-128, AES-192, AES-256).
-    """
-    aes_key = os.getenv('NOT_MY_KEY')
-    if aes_key is None:
-        raise ValueError("Environment variable NOT_MY_KEY is not set.")
-
-    aes_key = aes_key.encode("utf-8")
-    if len(aes_key) not in (16, 24, 32):
-        raise ValueError("AES key must be 16, 24, or 32 bytes. Current key length: {}".format(len(aes_key)))
-    return aes_key
-
-def create_users_table():
-    """Create the users table if it doesn't exist."""
-    with sqlite3.connect(DATABASE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                email TEXT UNIQUE,
-                date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_login TIMESTAMP
-            );
-        """)
-
-create_users_table()
-
-def generate_password():
-    """Generates a secure random password using UUIDv4"""
-    return str(uuid.uuid4())[:12]  # Truncate to 12 characters
-
-def hash_password(password):
-    """Hashes the password using Argon2"""
-    # Choose appropriate settings for time, memory, parallelism, key length, and salt
-    # Example with recommended settings from OWASP:
-    # https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#argon2id
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode('utf-8')
-
-def register_user(username, email):
-    """Registers a new user and returns the generated password"""
-    hashed_password = hash_password(generate_password())
-    cursor.execute("INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)",
-                   (username, hashed_password, email))
-    conn.commit()
-    return {"password": generate_password()}  # Return only the generated password
-
-def create_auth_logs_table():
-    """Create the auth_logs table if it doesn't exist."""
-    with sqlite3.connect(DATABASE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS auth_logs(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                request_ip TEXT NOT NULL,
-                request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                user_id INTEGER,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            );
-        """)
-
-create_auth_logs_table()
-
-
-def log_auth_attempt(ip_address, user_id):
-    """Logs an authentication attempt"""
-    cursor.execute("INSERT INTO auth_logs (request_ip, user_id) VALUES (?, ?)", (ip_address, user_id))
-    conn.commit()
-
-def authenticate_user(username, password):
-    """Authenticate the user by verifying the provided credentials."""
-    cursor.execute("SELECT id, password_hash FROM users WHERE username = ?", (username,))
-    user = cursor.fetchone()
-    if user:
-        user_id, stored_password_hash = user
-        # Verify the password
-        if bcrypt.checkpw(password.encode(), stored_password_hash.encode()):
-            return True, user_id
-    return False, None
-#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-class MyServer(BaseHTTPRequestHandler):
-    def do_POST(self):
-        parsed_path = urlparse(self.path)
-        params = parse_qs(parsed_path.query)
-
-        if parsed_path.path == "/auth":
-            # Parse JSON data from request body
-            content_length = int(self.headers.get('Content-Length', 0))
-            data = self.rfile.read(content_length).decode('utf-8')
-            try:
-                auth_data = json.loads(data)
-                username = auth_data.get("username")
-                password = auth_data.get("password")
-
-                if not username or not password:
-                    self.send_response(400, "Bad Request")
-                    self.end_headers()
-                    self.wfile.write(b"Missing username or password in request body.")
-                    return
-
-                # Authenticate the user
-                authentication_successful, user_id = authenticate_user(username, password)
-
-                if authentication_successful:
-                    # Log the successful authentication attempt
-                    log_auth_attempt(self.client_address[0], user_id)
-
-                    # Retrieve the correct private key
-                    private_key, key_pem, kid = get_private_key(expired='expired' in params)
-
-                    if private_key:
-                        headers = {"kid": str(kid)}  # Set kid from database in header
-                        token_payload = {
-                            "user": username,
-                            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()
-                            if 'expired' not in params else
-                            (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp()
-                        }
-                        # Sign the JWT using the private key in PEM format
-                        encoded_jwt = jwt.encode(token_payload, key_pem, algorithm="RS256", headers=headers)
-
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/json")
-                        self.end_headers()
-                        self.wfile.write(bytes(json.dumps({"token": encoded_jwt}), "utf-8"))
-                        return
-                    else:
-                        self.send_response(404, "Not Found")
-                        self.end_headers()
-                        self.wfile.write(b"Key not found.")
-                        return
-                else:
-                    # Log the failed authentication attempt
-                    log_auth_attempt(self.client_address[0], None)
-                    self.send_response(401, "Unauthorized")
-                    self.end_headers()
-                    self.wfile.write(b"Invalid username or password.")
-                    return
-            except json.JSONDecodeError:
-                self.send_response(400, "Bad Request")
-                self.end_headers()
-                self.wfile.write(b"Invalid JSON format in request body.")
-                return
-
-        self.send_response(405)
-        self.end_headers()
-
-        if parsed_path.path == "/register":
-            content_length = int(self.headers.get('Content-Length', 0))
-            data = self.rfile.read(content_length).decode('utf-8')
-            try:
-                user_data = json.loads(data)
-                username = user_data.get("username")
-                email = user_data.get("email")
-                if username and email:
-                    # Validate username and email (optional)
-                    # Check for existing username and email
-
-                    # Register user and return generated password
-                    registered_user = register_user(username, email)
-                    self.send_response(201, "Created")  # Use CREATED for user creation
-                    self.send_header("Content-type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(bytes(json.dumps(registered_user), "utf-8"))
-                    return
-                else:
-                    self.send_response(400, "Bad Request")
-                    self.end_headers()
-                    self.wfile.write(b"Missing username or email in request body.")
-                    return
-            except json.JSONDecodeError:
-                self.send_response(400, "Bad Request")
-                self.end_headers()
-                self.wfile.write(b"Invalid JSON format in request body.")
-                return
-
-        self.send_response(405)
-        self.end_headers()
-
-
-    def do_GET(self):
-        if self.path == "/.well-known/jwks.json":
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-
-            now = int(datetime.now(timezone.utc).timestamp())
-            cursor.execute("SELECT kid, key FROM keys WHERE exp > ?", (now,))
-            keys = []
-            for row in cursor.fetchall():
-                kid, key_pem = row[0], row[1]
-                public_key = serialization.load_pem_private_key(
-                    key_pem,
-                    password=None,
-                ).public_key()
-
-                keys.append({
-                    "alg": "RS256",
-                    "kty": "RSA",
-                    "use": "sig",
-                    "kid": str(kid),
-                    "n": int_to_base64(public_key.public_numbers().n),
-                    "e": int_to_base64(public_key.public_numbers().e),
-                })
-            jwks = {"keys": keys}
-            self.wfile.write(bytes(json.dumps(jwks), "utf-8"))
-            return
-
-        self.send_response(405)
-        self.end_headers()
-
-    def do_PUT(self):
-        self.send_response(405)
-        self.end_headers()
-
-    def do_PATCH(self):
-        self.send_response(405)
-        self.end_headers()
-
-    def do_DELETE(self):
-        self.send_response(405)
-        self.end_headers()
-
-    def do_HEAD(self):
-        self.send_response(405)
-        self.end_headers()
-
-if __name__ == "__main__":
-    webServer = HTTPServer((hostName, serverPort), MyServer)
+@app.route('/auth', methods=['POST'])
+@limiter.limit(auth_limit)
+def auth():
+    """Authenticate an user and return jwt token"""
     try:
-        print(f"Server started at http://{hostName}:{serverPort}")
-        webServer.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        data = request.get_json()
 
-    webServer.server_close()
-    conn.close()
-    print("Server stopped.")
+        if not data or 'password' not in data or 'username' not in data:
+            return jsonify({"error": "Username and password are required."}), 400
+
+        username = data['username']
+        password = data['password']
+        # check user in the database
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        c.execute('SELECT id, password_hash FROM users WHERE username = ?', (username,))
+        user = c.fetchone()
+        conn.close()
+
+        # validate user and password using bcrypt
+        if user is None or not bcrypt.checkpw(password.encode('utf-8'), user[1].encode('utf-8')):
+            return jsonify({"error": "Invalid username or password."}), 401
+
+        user_id = user[0]
+        request_ip = request.remote_addr
+
+        token = generate_jwt_token(user_id)
+        if not token:
+            return jsonify({"error": "Token generation failed."}), 500
+
+        # Log the authentication request
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        c.execute('INSERT INTO auth_logs (request_ip, user_id) VALUES (?, ?)', (request_ip, user_id))
+        conn.commit()
+        conn.close()
+
+        return jsonify({'token': token})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/register', methods=['POST'])
+def register():
+    """Register a new user"""
+    try:
+        data = request.get_json()
+        if not data or 'username' not in data or 'password' not in data:
+            return jsonify({"error": "Username and password are required."}), 400
+
+        username = data['username']
+        password = data['password']
+        password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        c.execute('INSERT INTO users (username, password_hash) VALUES (?, ?)', (username, password_hash))
+        conn.commit()
+        conn.close()
+
+        return jsonify({"message": "User registered successfully!"})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+if __name__ == '__main__':
+    init_db()
+    init_users_table()
+    init_auth_logs_table()
+    generate_and_store_keys()
+    app.run(debug=True)
